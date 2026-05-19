@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+
+netcheck.csv
+*.jsonl
+
+.DS_Store
+.venv/
+.claude/

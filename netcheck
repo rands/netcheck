@@ -1,0 +1,1369 @@
+#!/usr/bin/env python3
+"""netcheck — terminal network health monitor.
+
+Continuously samples latency, jitter, packet loss, DNS, throughput, and site
+reachability; renders a live dashboard with sparklines; logs every check to CSV.
+Built for flaky networks — plane WiFi, hotspots, cafes, captive portals.
+
+Requires macOS, Python 3.8+, and `ping` and `curl` in PATH. Uses only the
+standard library otherwise — no pip install. Linux/Windows are not currently
+supported (ping flags differ; gateway/WiFi probes are macOS-specific).
+"""
+
+__version__ = "1.0.0"
+
+import argparse
+import csv
+import json
+import os
+import re
+import shutil
+import socket
+import statistics
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from collections import deque
+from datetime import datetime
+
+# --- Config ---
+DEFAULT_PING_TARGETS = ["8.8.8.8", "1.1.1.1"]
+DNS_TEST_DOMAIN = "www.google.com"
+CAPTIVE_PORTAL_URL = "http://detectportal.firefox.com/success.txt"
+CAPTIVE_PORTAL_EXPECTED = "success\n"
+THROUGHPUT_URLS = [
+    "http://ajax.googleapis.com/ajax/libs/jquery/3.7.1/jquery.min.js",
+    "http://cdnjs.cloudflare.com/ajax/libs/lodash.js/4.17.21/lodash.min.js",
+    "http://detectportal.firefox.com/success.txt",
+]
+DEFAULT_INTERVAL = 10
+HISTORY_LEN = 60
+DEFAULT_PROBE_INTERVAL = 6
+DEFAULT_HEALTH_THRESHOLD = 50
+
+DEFAULT_PROBE_SITES = [
+    ("Google", "https://www.google.com"),
+    ("Wikipedia", "https://en.wikipedia.org"),
+    ("GitHub", "https://github.com"),
+    ("Reddit", "https://www.reddit.com"),
+    ("NYTimes", "https://www.nytimes.com"),
+]
+DEFAULT_LOG_FILE = os.path.expanduser("~/.netcheck/netcheck.csv")
+
+# --- Thresholds (ms / %) ---
+LATENCY_GOOD, LATENCY_WARN = 200, 600
+JITTER_GOOD, JITTER_WARN = 30, 100
+LOSS_GOOD, LOSS_WARN = 2, 10
+DNS_GOOD, DNS_WARN = 200, 800
+THROUGHPUT_GOOD, THROUGHPUT_WARN = 50, 10  # KB/s
+
+# --- ANSI colors ---
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+GREEN = "\033[92m"
+CYAN = "\033[96m"
+GRAY = "\033[90m"
+BG_RED = "\033[41m"
+BG_GREEN = "\033[42m"
+SPARKLINE_CHARS = "▁▂▃▄▅▆▇█"
+USE_COLOR = True
+
+
+def ansi(s):
+    return s if USE_COLOR else ""
+
+
+def strip_ansi(s):
+    return re.sub(r"\033\[[0-9;]*m", "", s)
+
+
+def color_val(val, good, warn, unit="", inverse=False, fmt=".0f"):
+    """Color a value green/yellow/red based on thresholds."""
+    if val is None:
+        return f"{ansi(RED)}{'--':>6}{unit}{ansi(RESET)}"
+    if inverse:
+        c = GREEN if val >= good else (YELLOW if val >= warn else RED)
+    else:
+        c = GREEN if val <= good else (YELLOW if val <= warn else RED)
+    return f"{ansi(c)}{val:>{6}{fmt}}{unit}{ansi(RESET)}"
+
+
+def sparkline(values, max_val=None):
+    """Render a sparkline from numeric values. None is rendered as a gap/failure."""
+    if not values:
+        return ""
+    nums = [v for v in values if v is not None]
+    if not nums:
+        return ansi(GRAY) + "?" * len(values) + ansi(RESET)
+    lo = min(nums)
+    hi = max_val or max(nums)
+    rng = hi - lo if hi > lo else 1
+    chars = []
+    for v in values:
+        if v is None:
+            chars.append(f"{ansi(RED)}x{ansi(RESET)}")
+        else:
+            idx = int((v - lo) / rng * (len(SPARKLINE_CHARS) - 1))
+            idx = max(0, min(idx, len(SPARKLINE_CHARS) - 1))
+            chars.append(SPARKLINE_CHARS[idx])
+    return "".join(chars)
+
+
+def percentile(values, pct):
+    nums = sorted(v for v in values if v is not None)
+    if not nums:
+        return None
+    if len(nums) == 1:
+        return nums[0]
+    rank = (len(nums) - 1) * pct / 100
+    lo = int(rank)
+    hi = min(lo + 1, len(nums) - 1)
+    frac = rank - lo
+    return nums[lo] * (1 - frac) + nums[hi] * frac
+
+
+def fmt_num(val, digits=1):
+    return "" if val is None else f"{val:.{digits}f}"
+
+
+def run_parallel(tasks, timeout=20):
+    """Run a dict of {name: callable} on daemon threads, in parallel.
+
+    Returns {name: result_or_None}, preserving insertion order. Any task that
+    raises or hasn't finished within `timeout` resolves to None.
+    """
+    results = {name: None for name in tasks}
+
+    def _worker(name, fn):
+        try:
+            results[name] = fn()
+        except Exception:
+            pass
+
+    threads = []
+    for name, fn in tasks.items():
+        t = threading.Thread(target=_worker, args=(name, fn), daemon=True)
+        t.start()
+        threads.append(t)
+    deadline = time.monotonic() + timeout
+    for t in threads:
+        t.join(timeout=max(0, deadline - time.monotonic()))
+    return results
+
+
+def ping_host(host, count=3, timeout_ms=3000):
+    """Ping a host. Returns a dict with latency/loss/error."""
+    try:
+        proc_timeout = (timeout_ms / 1000) * count + 5
+        r = subprocess.run(
+            ["ping", "-c", str(count), "-W", str(timeout_ms), "-q", host],
+            capture_output=True,
+            text=True,
+            timeout=proc_timeout,
+        )
+        output = r.stdout + r.stderr
+        loss_match = re.search(r"([\d.]+)% packet loss", output)
+        loss = float(loss_match.group(1)) if loss_match else 100.0
+        rtt_match = re.search(
+            r"(?:round-trip|rtt) min/avg/max/(?:stddev|mdev) = "
+            r"([\d.]+)/([\d.]+)/([\d.]+)/([\d.]+)",
+            output,
+        )
+        latency = float(rtt_match.group(2)) if rtt_match and loss < 100 else None
+        return {"target": host, "latency_ms": latency, "loss_pct": loss, "error": None}
+    except subprocess.TimeoutExpired:
+        return {"target": host, "latency_ms": None, "loss_pct": 100.0, "error": "timeout"}
+    except Exception as exc:
+        return {"target": host, "latency_ms": None, "loss_pct": 100.0, "error": type(exc).__name__}
+
+
+def get_gateway():
+    """Get default gateway IP."""
+    try:
+        r = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in r.stdout.splitlines():
+            if "gateway:" in line:
+                return line.split("gateway:", 1)[1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def ping_gateway(gateway):
+    """Check gateway reachability. Tries ICMP first, then TCP connect."""
+    if not gateway:
+        return {"latency_ms": None, "loss_pct": 100.0, "method": "none"}
+    icmp = ping_host(gateway, count=1, timeout_ms=2000)
+    if icmp["loss_pct"] < 100:
+        return {"latency_ms": icmp["latency_ms"], "loss_pct": icmp["loss_pct"], "method": "icmp"}
+    for port in (80, 443, 53):
+        try:
+            start = time.monotonic()
+            with socket.create_connection((gateway, port), timeout=2):
+                elapsed = (time.monotonic() - start) * 1000
+            return {"latency_ms": elapsed, "loss_pct": 0.0, "method": f"tcp/{port}"}
+        except Exception:
+            continue
+    return {"latency_ms": None, "loss_pct": 100.0, "method": "failed"}
+
+
+def dns_resolve(domain, timeout=5):
+    """Time DNS resolution in a bounded worker thread."""
+    result = {"ms": None, "ip": None, "error": None}
+
+    def _resolve():
+        start = time.monotonic()
+        try:
+            result["ip"] = socket.gethostbyname(domain)
+            result["ms"] = (time.monotonic() - start) * 1000
+        except Exception as exc:
+            result["error"] = type(exc).__name__
+
+    t = threading.Thread(target=_resolve, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        result["error"] = "timeout"
+    return result
+
+
+def check_captive_portal():
+    """Return portal status plus status code/final URL/error details."""
+    result = {
+        "detected": None,
+        "status": None,
+        "final_url": None,
+        "error": None,
+        "body_sample": "",
+    }
+    try:
+        req = urllib.request.Request(CAPTIVE_PORTAL_URL, headers={"User-Agent": f"netcheck/{__version__}"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = resp.read(256).decode("utf-8", errors="replace")
+            result["status"] = getattr(resp, "status", None)
+            result["final_url"] = resp.geturl()
+            result["body_sample"] = data[:80].replace("\n", "\\n")
+            result["detected"] = data != CAPTIVE_PORTAL_EXPECTED or resp.geturl() != CAPTIVE_PORTAL_URL
+    except urllib.error.HTTPError as exc:
+        result.update({"detected": True, "status": exc.code, "final_url": exc.geturl(), "error": "HTTPError"})
+    except Exception as exc:
+        result["error"] = type(exc).__name__
+    return result
+
+
+def check_throughput():
+    """Download a small file and measure speed in KB/s."""
+    errors = []
+    for url in THROUGHPUT_URLS:
+        try:
+            start = time.monotonic()
+            req = urllib.request.Request(url, headers={"User-Agent": f"netcheck/{__version__}"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = resp.read()
+            elapsed = time.monotonic() - start
+            size_kb = len(data) / 1024
+            return {
+                "kb_per_sec": size_kb / elapsed if elapsed > 0 else 0,
+                "size_kb": size_kb,
+                "url": url,
+                "error": None,
+            }
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}")
+    return {"kb_per_sec": None, "size_kb": None, "url": None, "error": "; ".join(errors)}
+
+
+CURL_FORMAT = (
+    "%{time_namelookup}\t%{time_connect}\t%{time_appconnect}\t"
+    "%{time_starttransfer}\t%{time_total}\t%{http_code}\t"
+    "%{size_download}\t%{url_effective}\t%{errormsg}"
+)
+
+
+def probe_site(url, timeout=10):
+    """Probe a URL with curl and return timing/status details."""
+    try:
+        r = subprocess.run(
+            [
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                CURL_FORMAT,
+                "-L",
+                "--max-time",
+                str(timeout),
+                url,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5,
+        )
+        fields = r.stdout.rstrip("\n").split("\t", 8)
+        if len(fields) != 9:
+            return {"ok": False, "code": 0, "error": "bad curl output"}
+        dns_s, tcp_s, tls_s, ttfb_s, total_s, code_s, size_s, final_url, err = fields
+        dns = float(dns_s)
+        tcp = float(tcp_s)
+        tls = float(tls_s)
+        ttfb = float(ttfb_s)
+        total = float(total_s)
+        code = int(code_s)
+        size = int(size_s)
+        ok = 200 <= code < 400
+        err = err or None
+        if code == 0 and not err:
+            err = r.stderr.strip() or "curl failed"
+        return {
+            "ok": ok,
+            "dns": dns * 1000,
+            "tcp": max(0, (tcp - dns) * 1000),
+            "tls": max(0, (tls - tcp) * 1000) if tls > 0 else 0,
+            "ttfb": max(0, (ttfb - (tls if tls > 0 else tcp)) * 1000),
+            "total": total * 1000,
+            "code": code,
+            "size_kb": size / 1024,
+            "final_url": final_url,
+            "error": err,
+        }
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "code": 0, "error": "timeout"}
+    except Exception as exc:
+        return {"ok": False, "code": 0, "error": type(exc).__name__}
+
+
+def run_site_probes(probe_sites):
+    """Probe all configured sites in parallel."""
+    def _task(name, url):
+        return lambda: {"name": name, "url": url, "result": probe_site(url)}
+
+    tasks = {f"probe_{i}": _task(name, url) for i, (name, url) in enumerate(probe_sites)}
+    raw = run_parallel(tasks, timeout=15)
+    return [raw[k] for k in tasks if raw[k] is not None]
+
+
+AIRPORT_PATH = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+
+
+class WifiInfoPoller:
+    """Polls WiFi info in a background thread."""
+
+    def __init__(self, interval=10, wait_first=False, wait_timeout=15):
+        self.info = {}
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._has_airport = os.path.exists(AIRPORT_PATH)
+        self._first_poll = threading.Event()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+        if wait_first:
+            self._first_poll.wait(timeout=wait_timeout)
+
+    def _poll_airport(self):
+        r = subprocess.run([AIRPORT_PATH, "-I"], capture_output=True, text=True, timeout=5)
+        info = {}
+        key_map = {
+            "SSID": "ssid",
+            "BSSID": "bssid",
+            "agrCtlRSSI": "rssi",
+            "agrCtlNoise": "noise",
+            "lastTxRate": "tx_rate",
+            "maxRate": "max_rate",
+            "channel": "channel",
+            "op mode": "op_mode",
+            "MCS": "mcs",
+        }
+        for line in r.stdout.splitlines():
+            if ":" not in line:
+                continue
+            raw_key, raw_val = line.strip().split(":", 1)
+            key = key_map.get(raw_key.strip())
+            if not key:
+                continue
+            val = raw_val.strip()
+            if key in {"rssi", "noise", "tx_rate", "max_rate", "mcs"}:
+                try:
+                    val = int(val)
+                except ValueError:
+                    pass
+            info[key] = val
+        return info
+
+    def _poll_system_profiler(self):
+        r = subprocess.run(
+            ["system_profiler", "SPAirPortDataType", "-detailLevel", "basic"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        info = {}
+        in_current = False
+        for line in r.stdout.splitlines():
+            stripped = line.strip()
+            if "Current Network Information:" in stripped:
+                in_current = True
+                continue
+            if in_current and "PHY Mode:" in stripped:
+                info["phy_mode"] = stripped.split(":", 1)[1].strip()
+            elif in_current and "Channel:" in stripped:
+                info["channel"] = stripped.split(":", 1)[1].strip()
+            elif in_current and "Signal / Noise:" in stripped:
+                m = re.search(r"(-?\d+)\s*dBm\s*/\s*(-?\d+)\s*dBm", stripped)
+                if m:
+                    info["rssi"] = int(m.group(1))
+                    info["noise"] = int(m.group(2))
+            elif in_current and "Transmit Rate:" in stripped:
+                m = re.search(r"(\d+)", stripped)
+                if m:
+                    info["tx_rate"] = int(m.group(1))
+            elif in_current and "BSSID:" in stripped:
+                info["bssid"] = stripped.split(":", 1)[1].strip()
+            elif in_current and "SSID:" in stripped:
+                info["ssid"] = stripped.split(":", 1)[1].strip()
+            elif in_current and "Security:" in stripped and "ssid" not in info:
+                # Older system_profiler output puts the SSID on the preceding header line.
+                pass
+            elif in_current and stripped.endswith(":") and "ssid" not in info:
+                info["ssid"] = stripped.rstrip(":")
+        return info
+
+    def _poll(self):
+        while True:
+            info = {}
+            try:
+                info = self._poll_airport() if self._has_airport else self._poll_system_profiler()
+            except Exception:
+                pass
+            with self._lock:
+                self.info = info
+            self._first_poll.set()
+            time.sleep(self.interval)
+
+    def get(self):
+        with self._lock:
+            return dict(self.info)
+
+
+def score_lower_better(val, good, warn):
+    if val is None:
+        return None
+    if val <= good:
+        return 100
+    if val <= warn:
+        return 100 - 50 * (val - good) / (warn - good)
+    ceiling = warn * 2
+    if val >= ceiling:
+        return 0
+    return 50 * (1 - (val - warn) / (ceiling - warn))
+
+
+def score_higher_better(val, good, warn):
+    if val is None:
+        return None
+    if val >= good:
+        return 100
+    if val >= warn:
+        return 50 + 50 * (val - warn) / (good - warn)
+    if warn == 0:
+        return 0
+    return max(0, 50 * val / warn)
+
+
+HEALTH_WEIGHTS = {
+    "loss": 0.25,
+    "latency": 0.20,
+    "probes": 0.15,
+    "throughput": 0.15,
+    "gateway": 0.10,
+    "jitter": 0.10,
+    "dns": 0.05,
+}
+
+BOTTLENECK_PRIORITY = ["loss", "latency", "gateway", "dns", "throughput", "probes", "jitter"]
+
+
+def compute_health(latency, jitter, loss, dns_ms, throughput, gw_ok=True, probe_results=None, is_up=True):
+    """Compute a 0-100 composite health score and component scores."""
+    components = {
+        "loss": score_lower_better(loss, LOSS_GOOD, LOSS_WARN),
+        "latency": score_lower_better(latency, LATENCY_GOOD, LATENCY_WARN),
+        "throughput": score_higher_better(throughput, THROUGHPUT_GOOD, THROUGHPUT_WARN),
+        "gateway": 100 if gw_ok else 0,
+        "jitter": score_lower_better(jitter, JITTER_GOOD, JITTER_WARN),
+        "dns": score_lower_better(dns_ms, DNS_GOOD, DNS_WARN),
+    }
+    if not is_up:
+        # Don't credit stale probe success once we're offline.
+        components["probes"] = 0
+    elif probe_results:
+        successful = sum(1 for p in probe_results if p["result"].get("ok"))
+        components["probes"] = (successful / len(probe_results)) * 100
+    else:
+        components["probes"] = None  # no probes yet — exclude from score
+
+    measured = {k: v for k, v in components.items() if v is not None}
+    if not measured:
+        return 0, components
+    total_weight = sum(HEALTH_WEIGHTS[k] for k in measured)
+    health = sum(measured[k] * HEALTH_WEIGHTS[k] for k in measured) / total_weight
+    return health, components
+
+
+def bottleneck(components):
+    labels = {
+        "loss": "packet loss",
+        "latency": "latency",
+        "probes": "site access",
+        "throughput": "throughput",
+        "gateway": "gateway",
+        "jitter": "jitter",
+        "dns": "DNS",
+    }
+    measured = {k: v for k, v in components.items() if v is not None}
+    if not measured:
+        return "none"
+    min_val = min(measured.values())
+    if min_val >= 85:
+        return "none"
+    for key in BOTTLENECK_PRIORITY:
+        if key in measured and measured[key] == min_val:
+            return labels[key]
+    return labels[next(iter(measured))]
+
+
+def quality_label(score):
+    if score >= 90:
+        return f"{ansi(GREEN)}Video/calls OK{ansi(RESET)}"
+    if score >= 70:
+        return f"{ansi(GREEN)}Browsing OK{ansi(RESET)}"
+    if score >= 50:
+        return f"{ansi(YELLOW)}Chat/text only{ansi(RESET)}"
+    if score >= 25:
+        return f"{ansi(RED)}Barely usable{ansi(RESET)}"
+    return f"{ansi(RED)}Unusable{ansi(RESET)}"
+
+
+def health_bar(score, width=20):
+    filled = int(score / 100 * width)
+    c = GREEN if score >= 75 else (YELLOW if score >= 45 else RED)
+    bar = ansi(c) + "█" * filled + ansi(GRAY) + "░" * (width - filled) + ansi(RESET)
+    return f"{bar} {ansi(c)}{ansi(BOLD)}{score:.0f}{ansi(RESET)}{ansi(c)}/100{ansi(RESET)}"
+
+
+def status_badge(up):
+    if up:
+        return f"{ansi(BG_GREEN)}{ansi(BOLD)} UP {ansi(RESET)}"
+    return f"{ansi(BG_RED)}{ansi(BOLD)} DOWN {ansi(RESET)}"
+
+
+def clear_screen():
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def move_home():
+    sys.stdout.write("\033[H")
+    sys.stdout.flush()
+
+
+def term_size():
+    return shutil.get_terminal_size(fallback=(80, 24))
+
+
+def init_csv(path):
+    if not path or os.path.exists(path):
+        return
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(
+            [
+                "timestamp",
+                "state",
+                "health",
+                "bottleneck",
+                "latency_ms",
+                "latency_p50_ms",
+                "latency_p95_ms",
+                "jitter_ms",
+                "loss_pct",
+                "dns_ms",
+                "throughput_kBps",
+                "gateway_ok",
+                "gateway_ms",
+                "gateway_method",
+                "captive_portal",
+                "portal_status",
+                "portal_final_url",
+                "ssid",
+                "rssi",
+                "noise",
+                "tx_rate_mbps",
+                "channel",
+                "ping_targets",
+            ]
+        )
+
+
+def log_csv(path, result):
+    if not path:
+        return
+    wifi = result["wifi"]
+    gateway = result["gateway"]
+    portal = result["portal"]
+    row = [
+        result["timestamp"],
+        "UP" if result["is_up"] else "DOWN",
+        f"{result['health']:.0f}",
+        result["bottleneck"],
+        fmt_num(result["avg_latency_ms"]),
+        fmt_num(result["latency_p50_ms"]),
+        fmt_num(result["latency_p95_ms"]),
+        fmt_num(result["jitter_ms"]),
+        fmt_num(result["avg_loss_pct"]),
+        fmt_num(result["dns"]["ms"]),
+        fmt_num(result["throughput"]["kb_per_sec"]),
+        "yes" if result["gateway_ok"] else "no",
+        fmt_num(gateway["latency_ms"]),
+        gateway["method"],
+        "" if portal["detected"] is None else ("yes" if portal["detected"] else "no"),
+        portal["status"] if portal["status"] is not None else "",
+        portal["final_url"] or "",
+        wifi.get("ssid", ""),
+        wifi.get("rssi", ""),
+        wifi.get("noise", ""),
+        wifi.get("tx_rate", ""),
+        wifi.get("channel", ""),
+        json.dumps(result["ping_results"], separators=(",", ":")),
+    ]
+    with open(path, "a", newline="") as f:
+        csv.writer(f).writerow(row)
+
+
+def log_jsonl(path, result):
+    if not path:
+        return
+    with open(path, "a") as f:
+        f.write(json.dumps(result, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def parse_probe_site(value):
+    if "=" in value:
+        name, url = value.split("=", 1)
+        return name.strip(), url.strip()
+    url = value.strip()
+    name = re.sub(r"^https?://", "", url).split("/", 1)[0]
+    return name, url
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Terminal network health monitor.")
+    p.add_argument("--version", action="version", version=f"netcheck {__version__}")
+    p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="seconds between checks")
+    p.add_argument("--log-file", default=DEFAULT_LOG_FILE, help="CSV log path; use '' to disable")
+    p.add_argument("--json-log", default=None, help="optional JSONL log path")
+    p.add_argument("--json", action="store_true", help="print one JSON result and exit")
+    p.add_argument("--once", action="store_true", help="run one check and exit")
+    p.add_argument("--quiet", action="store_true", help="suppress dashboard output")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    p.add_argument("--targets", default=",".join(DEFAULT_PING_TARGETS), help="comma-separated ping targets")
+    p.add_argument(
+        "--probe-site",
+        action="append",
+        default=[],
+        metavar="NAME=URL",
+        help="site probe; repeat to replace defaults",
+    )
+    p.add_argument("--no-probes", action="store_true", help="disable site probes")
+    p.add_argument("--probe-interval", type=int, default=DEFAULT_PROBE_INTERVAL, help="checks between probes")
+    p.add_argument("--threshold", type=int, default=DEFAULT_HEALTH_THRESHOLD, help="--once unhealthy exit threshold")
+    p.add_argument("--notify", action="store_true", help="macOS notification on UP/DOWN transitions")
+    p.add_argument("--sound", action="store_true", help="terminal bell on UP/DOWN transitions")
+    args = p.parse_args()
+    args.targets = [t.strip() for t in args.targets.split(",") if t.strip()]
+    args.probe_sites = [] if args.no_probes else DEFAULT_PROBE_SITES
+    if args.probe_site:
+        args.probe_sites = [parse_probe_site(v) for v in args.probe_site]
+    if args.json:
+        args.once = True
+    return args
+
+
+def _collect_ping_metrics(args, state):
+    """Ping every target plus the gateway in parallel; update history; return summary."""
+    def _ping_task(host):
+        return lambda: ping_host(host, count=3, timeout_ms=3000)
+
+    tasks = {f"target_{i}": _ping_task(t) for i, t in enumerate(args.targets)}
+    tasks["gateway"] = lambda: ping_gateway(state["gateway_ip"])
+    raw = run_parallel(tasks, timeout=15)
+
+    gateway = raw["gateway"] or {"latency_ms": None, "loss_pct": 100.0, "method": "none"}
+    ping_results = [raw[f"target_{i}"] for i in range(len(args.targets)) if raw[f"target_{i}"]]
+    latencies = [r["latency_ms"] for r in ping_results if r["latency_ms"] is not None]
+    losses = [r["loss_pct"] for r in ping_results]
+    avg_latency = statistics.mean(latencies) if latencies else None
+    avg_loss = statistics.mean(losses) if losses else 100.0
+
+    state["latency_hist"].append(avg_latency)
+    state["loss_hist"].append(avg_loss)
+    recent_latencies = [v for v in state["latency_hist"] if v is not None]
+    jitter = statistics.stdev(recent_latencies) if len(recent_latencies) >= 2 else None
+    state["jitter_hist"].append(jitter)
+
+    return {
+        "ping_results": ping_results,
+        "gateway": gateway,
+        "gateway_ok": gateway["loss_pct"] < 100,
+        "avg_latency": avg_latency,
+        "avg_loss": avg_loss,
+        "jitter": jitter,
+        "is_up": avg_latency is not None and avg_loss < 100,
+    }
+
+
+def _collect_service_metrics(args, state, is_up, force_probes):
+    """Run DNS, captive-portal, throughput, and (sometimes) site probes in parallel.
+
+    Returns (dns, portal, throughput). When the network is down, returns blanks.
+    Probe results are stashed on `state["probe_results"]` since they're sampled
+    less often than the other metrics.
+    """
+    dns = {"ms": None, "ip": None, "error": None}
+    portal = {"detected": None, "status": None, "final_url": None, "error": None, "body_sample": ""}
+    throughput = {"kb_per_sec": None, "size_kb": None, "url": None, "error": None}
+    if not is_up:
+        return dns, portal, throughput
+
+    should_probe = bool(args.probe_sites) and (
+        force_probes or state["iteration"] % max(1, args.probe_interval) == 0
+    )
+    tasks = {
+        "dns": lambda: dns_resolve(DNS_TEST_DOMAIN),
+        "portal": check_captive_portal,
+        "throughput": check_throughput,
+    }
+    if should_probe:
+        tasks["probes"] = lambda: run_site_probes(args.probe_sites)
+    raw = run_parallel(tasks, timeout=20)
+
+    if raw.get("probes") is not None:
+        state["probe_results"] = raw["probes"]
+    return raw["dns"] or dns, raw["portal"] or portal, raw["throughput"] or throughput
+
+
+def _record_transition(args, state, now, is_up, health):
+    """Update up/down counts; on state change, append to history and fire side effects."""
+    if is_up:
+        state["up_count"] += 1
+    else:
+        state["down_count"] += 1
+    if state["last_state"] is None or is_up != state["last_state"]:
+        transition = (now.strftime("%H:%M:%S"), "UP" if is_up else "DOWN")
+        state["transitions"].append(transition)
+        state["events"].append({"time": now, "state": transition[1]})
+        if state["last_state"] is not None:
+            if args.sound:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+            if args.notify:
+                notify_transition(transition[1], health)
+    state["last_state"] = is_up
+
+
+def collect_check(args, state, wifi_poller, force_probes=False):
+    """Run one health-check cycle: ping → services → score → record → assemble result."""
+    now = datetime.now()
+    if state["iteration"] % 30 == 0 or not state["gateway_ip"]:
+        state["gateway_ip"] = get_gateway()
+
+    pings = _collect_ping_metrics(args, state)
+    is_up = pings["is_up"]
+
+    dns, portal, throughput = _collect_service_metrics(args, state, is_up, force_probes)
+    state["dns_hist"].append(dns["ms"])
+    state["throughput_hist"].append(throughput["kb_per_sec"])
+
+    health, components = compute_health(
+        pings["avg_latency"], pings["jitter"], pings["avg_loss"],
+        dns["ms"], throughput["kb_per_sec"],
+        pings["gateway_ok"], state["probe_results"], is_up,
+    )
+    state["health_hist"].append(health)
+    _record_transition(args, state, now, is_up, health)
+
+    result = {
+        "timestamp": now.isoformat(),
+        "is_up": is_up,
+        "health": health,
+        "components": components,
+        "bottleneck": bottleneck(components),
+        "avg_latency_ms": pings["avg_latency"],
+        "latency_p50_ms": percentile(state["latency_hist"], 50),
+        "latency_p95_ms": percentile(state["latency_hist"], 95),
+        "jitter_ms": pings["jitter"],
+        "avg_loss_pct": pings["avg_loss"],
+        "dns": dns,
+        "throughput": throughput,
+        "gateway_ip": state["gateway_ip"],
+        "gateway": pings["gateway"],
+        "gateway_ok": pings["gateway_ok"],
+        "portal": portal,
+        "wifi": wifi_poller.get() if wifi_poller else {},
+        "ping_results": pings["ping_results"],
+        "probe_results": state["probe_results"],
+        "uptime_pct": uptime_pct(state),
+        "checks": state["up_count"] + state["down_count"],
+    }
+    state["check_log"].append({"time": now, "health": health, "is_up": is_up})
+    state["last_result"] = result
+    return result
+
+
+def uptime_pct(state):
+    total = state["up_count"] + state["down_count"]
+    return (state["up_count"] / total * 100) if total else 0
+
+
+def notify_transition(status, health):
+    try:
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "Network {status}, health {health:.0f}/100" with title "netcheck"',
+            ],
+            capture_output=True,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
+def new_state():
+    return {
+        "latency_hist": deque(maxlen=HISTORY_LEN),
+        "loss_hist": deque(maxlen=HISTORY_LEN),
+        "dns_hist": deque(maxlen=HISTORY_LEN),
+        "throughput_hist": deque(maxlen=HISTORY_LEN),
+        "jitter_hist": deque(maxlen=HISTORY_LEN),
+        "health_hist": deque(maxlen=HISTORY_LEN),
+        "up_count": 0,
+        "down_count": 0,
+        "transitions": deque(maxlen=500),
+        "events": deque(maxlen=1000),
+        "check_log": deque(maxlen=5000),
+        "last_state": None,
+        "start_time": datetime.now(),
+        "gateway_ip": None,
+        "probe_results": [],
+        "iteration": 0,
+        "last_result": None,
+    }
+
+
+def plain_summary(result):
+    state = "UP" if result["is_up"] else "DOWN"
+    portal = portal_label(result["portal"], plain=True)
+    return (
+        f"{state} health={result['health']:.0f}/100 "
+        f"lat={fmt_num(result['avg_latency_ms']) or '--'}ms "
+        f"loss={fmt_num(result['avg_loss_pct'])}% "
+        f"dns={fmt_num(result['dns']['ms']) or '--'}ms "
+        f"throughput={fmt_num(result['throughput']['kb_per_sec']) or '--'}KB/s "
+        f"bottleneck={result['bottleneck']} portal={portal}"
+    )
+
+
+def portal_label(portal, plain=False):
+    detected = portal.get("detected")
+    if detected is True:
+        text = "captive"
+        return text if plain else f"{ansi(RED)}{ansi(BOLD)}{text}{ansi(RESET)}"
+    if detected is False:
+        text = "clean"
+        return text if plain else f"{ansi(GREEN)}{text}{ansi(RESET)}"
+    text = "unknown"
+    return text if plain else f"{ansi(YELLOW)}{text}{ansi(RESET)}"
+
+
+def signal_label(rssi):
+    """RSSI in dBm → (human label, color). Returns (None, DIM) if unknown."""
+    if rssi is None:
+        return None, DIM
+    if rssi >= -50:
+        return "Excellent", GREEN
+    if rssi >= -65:
+        return "Good", GREEN
+    if rssi >= -75:
+        return "Fair", YELLOW
+    return "Weak", RED
+
+
+def speed_label(tx_rate):
+    """Tx link rate (Mbps int) → 'X Mbps' or 'X.Y Gbps'. None if unknown."""
+    if not tx_rate:
+        return None
+    if tx_rate >= 1000:
+        return f"{tx_rate / 1000:.1f} Gbps"
+    return f"{tx_rate} Mbps"
+
+
+def band_label(channel):
+    """Channel field (e.g. '149 (5GHz, 80MHz)' or '149,80') → '2.4 GHz' / '5 GHz' / '6 GHz'."""
+    if not channel:
+        return None
+    s = str(channel).lower()
+    if "5ghz" in s or "5 ghz" in s:
+        return "5 GHz"
+    if "6ghz" in s or "6 ghz" in s:
+        return "6 GHz"
+    if "2ghz" in s or "2 ghz" in s or "2.4" in s:
+        return "2.4 GHz"
+    m = re.match(r"\s*(\d+)", s)
+    if m:
+        ch = int(m.group(1))
+        if 1 <= ch <= 14:
+            return "2.4 GHz"
+        if 36 <= ch <= 177:
+            return "5 GHz"
+    return None
+
+
+CURL_ERROR_TAGS = (
+    (("could not resolve", "name resolution", "unknown host"), "DNS fail"),
+    (("timed out", "timeout"), "timeout"),
+    (("refused",), "refused"),
+    (("ssl", "tls", "certificate", "handshake"), "TLS fail"),
+    (("empty reply",), "no reply"),
+    (("reset by peer", "connection reset"), "reset"),
+    (("no route", "host is unreachable", "network is unreachable"), "no route"),
+)
+
+
+def short_probe_error(err):
+    if not err:
+        return "error"
+    e = err.lower()
+    for needles, tag in CURL_ERROR_TAGS:
+        if any(n in e for n in needles):
+            return tag
+    return "error"
+
+
+def stale_label(val, hist):
+    """If `val` is missing, decide what to render in the value column."""
+    if val is not None:
+        return None
+    return "timing out" if any(v is not None for v in hist) else "no data"
+
+
+def diagnose(result):
+    """One-line explanation when the metric grid doesn't tell the real story."""
+    if result["portal"].get("detected") is True:
+        return "Captive portal — sign in required"
+    if not result["is_up"]:
+        if result["gateway_ok"]:
+            return "Gateway reachable, Internet unreachable — likely captive portal or carrier outage"
+        return "Gateway unreachable — WiFi associated but no link to router"
+    return None
+
+
+def render_dashboard(args, state, result):
+    move_home()
+    size = term_size()
+    w = size.columns
+    lines = []
+    elapsed_total = (datetime.now() - state["start_time"]).total_seconds()
+    runtime = f"{int(elapsed_total // 60)}m {int(elapsed_total % 60)}s"
+    wifi = result["wifi"]
+    rssi = wifi.get("rssi")
+    sig_text, sig_color = signal_label(rssi)
+    speed = speed_label(wifi.get("tx_rate"))
+    band = band_label(wifi.get("channel"))
+
+    state_color = GREEN if result["is_up"] else RED
+    state_text = "UP" if result["is_up"] else "DOWN"
+    sep = f" {ansi(GRAY)}·{ansi(RESET)} "
+    net_bits = [f"{ansi(BOLD)}{wifi.get('ssid') or 'unknown'}{ansi(RESET)}"]
+    if band:
+        net_bits.append(band)
+    if sig_text:
+        net_bits.append(f"{ansi(sig_color)}{sig_text}{ansi(RESET)}")
+    if speed:
+        net_bits.append(speed)
+    header_left = (
+        f"{ansi(BOLD)}{ansi(CYAN)}netcheck{ansi(RESET)}   "
+        f"{ansi(state_color)}●{ansi(RESET)} "
+        f"{ansi(BOLD)}{ansi(state_color)}{state_text}{ansi(RESET)}{sep}"
+        + sep.join(net_bits)
+    )
+    header_right = f"{ansi(DIM)}{runtime}{ansi(RESET)}"
+    left_w = len(strip_ansi(header_left))
+    right_w = len(strip_ansi(header_right))
+    pad = max(2, w - left_w - right_w - 1)
+    lines.append(header_left + " " * pad + header_right)
+    lines.append("")
+
+    spark_w = min(30, max(10, w - 50))
+    health_spark_w = max(20, w - 18)
+    health_spark = sparkline(list(state["health_hist"])[-health_spark_w:], max_val=100)
+    lines.append(
+        f"  {'Health':<14} {health_bar(result['health'])}   {quality_label(result['health'])}"
+    )
+    lines.append(f"  {'':<14} {health_spark}")
+    diag = diagnose(result)
+    if diag:
+        lines.append(f"  {'':<14} {ansi(YELLOW)}↳ {diag}{ansi(RESET)}")
+    lines.append("")
+
+    val_col_w = 11
+
+    def metric_line(label, val, good, warn, unit, hist, max_v=None, inverse=False, fmt=".0f", missing=None, suffix=""):
+        sl = sparkline(list(hist)[-spark_w:], max_val=max_v)
+        if val is None and missing:
+            color = GRAY if missing == "no data" else RED
+            cell = f"{ansi(color)}{missing:>{val_col_w}}{ansi(RESET)}"
+        else:
+            cv = color_val(val, good, warn, unit, inverse=inverse, fmt=fmt)
+            pad = max(0, val_col_w - (6 + len(unit)))
+            cell = f"{cv}{' ' * pad}"
+        line = f"  {label:<14} {cell}  {sl}"
+        if suffix:
+            line += f"   {suffix}"
+        return line
+
+    latency_v = result["avg_latency_ms"]
+    jitter_v = result["jitter_ms"]
+    dns_v = result["dns"]["ms"]
+    throughput_v = result["throughput"]["kb_per_sec"]
+    p50 = fmt_num(result["latency_p50_ms"], 0) or "--"
+    p95 = fmt_num(result["latency_p95_ms"], 0) or "--"
+    lat_suffix = f"{ansi(DIM)}p50 {p50}{sep}p95 {p95}{ansi(RESET)}"
+    lines.append(metric_line(
+        "Latency", latency_v, LATENCY_GOOD, LATENCY_WARN, " ms", state["latency_hist"], 1000,
+        missing=stale_label(latency_v, state["latency_hist"]),
+        suffix=lat_suffix,
+    ))
+    lines.append(metric_line(
+        "Jitter", jitter_v, JITTER_GOOD, JITTER_WARN, " ms", state["jitter_hist"], 200,
+        missing=stale_label(jitter_v, state["jitter_hist"]),
+    ))
+    lines.append(metric_line("Loss", result["avg_loss_pct"], LOSS_GOOD, LOSS_WARN, " %", state["loss_hist"], 100))
+    lines.append(metric_line(
+        "DNS", dns_v, DNS_GOOD, DNS_WARN, " ms", state["dns_hist"], 1000,
+        missing=stale_label(dns_v, state["dns_hist"]),
+    ))
+    lines.append(
+        metric_line(
+            "Throughput",
+            throughput_v,
+            THROUGHPUT_GOOD,
+            THROUGHPUT_WARN,
+            " KB/s",
+            state["throughput_hist"],
+            200,
+            inverse=True,
+            fmt=".1f",
+            missing=stale_label(throughput_v, state["throughput_hist"]),
+        )
+    )
+    lines.append("")
+
+    upct = result["uptime_pct"]
+    up_color = GREEN if upct >= 95 else (YELLOW if upct >= 80 else RED)
+    uptime_str = f"{ansi(up_color)}{upct:.1f}%{ansi(RESET)} uptime"
+    checks_str = f"{ansi(DIM)}{state['up_count']}/{result['checks']} checks{ansi(RESET)}"
+    portal_str = f"portal {portal_label(result['portal'])}"
+    lines.append(f"  {'Session':<14} " + sep.join([uptime_str, checks_str, portal_str]))
+
+    gateway = result["gateway"]
+    if result["gateway_ok"]:
+        gw_color = GREEN
+        gw_latency_str = f"{gateway['latency_ms']:.0f} ms via {gateway['method']}" if gateway["latency_ms"] is not None else gateway["method"]
+    elif result["is_up"]:
+        gw_color = YELLOW
+        gw_latency_str = "filtered"
+    else:
+        gw_color = RED
+        gw_latency_str = "unreachable"
+    gw_ip = result["gateway_ip"] or "?"
+    lines.append(
+        f"  {'Gateway':<14} {ansi(gw_color)}●{ansi(RESET)} "
+        f"{ansi(gw_color)}{gw_latency_str}{ansi(RESET)}{sep}{ansi(DIM)}{gw_ip}{ansi(RESET)}"
+    )
+    lines.append("")
+
+    if result["probe_results"]:
+        iters_until_probe = (max(1, args.probe_interval) - (state["iteration"] % max(1, args.probe_interval))) % max(1, args.probe_interval)
+        probe_eta = "just ran" if iters_until_probe == 0 else f"next in {iters_until_probe * args.interval}s"
+        lines.append(f"  {ansi(BOLD)}Site Probes{ansi(RESET)}  {ansi(DIM)}({probe_eta}){ansi(RESET)}")
+        lines.append(f"  {ansi(DIM)}{'':>12} {'Code':>4} {'DNS':>6} {'TTFB':>6} {'Total':>7}{ansi(RESET)}")
+        def _fmt_t(v):
+            return f"{v:>5.0f}" if v is not None else f"{'--':>5}"
+
+        for probe in result["probe_results"]:
+            name = probe["name"]
+            t = probe["result"]
+            if t.get("ok"):
+                dns_c = timing_color(t["dns"], 50, 200)
+                ttfb_c = timing_color(t["ttfb"], 300, 800)
+                total_c = timing_color(t["total"], 1000, 3000)
+                lines.append(f"  {name:>12} {t['code']:>4} {dns_c}  {ttfb_c}  {total_c} ms")
+            else:
+                code = t.get("code") or 0
+                code_str = str(code) if code else "--"
+                tag = f"HTTP {code}" if code >= 400 else short_probe_error(t.get("error"))
+                lines.append(
+                    f"  {ansi(RED)}{name:>12} {code_str:>4} "
+                    f"{_fmt_t(t.get('dns'))}  {_fmt_t(t.get('ttfb'))}  {_fmt_t(t.get('total'))} ms"
+                    f"  {tag}{ansi(RESET)}"
+                )
+        lines.append("")
+
+    if state["events"]:
+        lines.extend(render_transitions(state))
+        lines.append("")
+
+    log_parts = []
+    if args.log_file:
+        log_parts.append(args.log_file)
+    if args.json_log:
+        log_parts.append(args.json_log)
+    log_str = (" " + chr(0xB7) + " ").join(log_parts) if log_parts else "no log"
+    footer_left = f"  {ansi(DIM)}{'─' * 8}  {log_str}  ·  ⌃C to quit{ansi(RESET)}"
+    countdown_row = len(lines) + 1
+    bar_visible = 10 + 1 + 4  # 10 cells + space + "Ns " worst-case
+    left_w = len(strip_ansi(footer_left))
+    gap = max(2, w - left_w - bar_visible - 1)
+    countdown_prefix = footer_left + " " * gap
+    lines.append(
+        f"{countdown_prefix}{ansi(CYAN)}{'█' * 10}{ansi(RESET)} {ansi(DIM)}{args.interval}s{ansi(RESET)}"
+    )
+
+    clear_eol = "\033[K"
+    while len(lines) < size.lines - 1:
+        lines.append("")
+    output = "\n".join(line + clear_eol for line in lines[: size.lines - 1])
+    print(output, flush=True)
+    return countdown_row, countdown_prefix
+
+
+def render_transitions(state, max_segments=7):
+    """Render the Transitions block: current-state pill + duration ribbon.
+
+    Top line   : ● UP for 24s            3 outages · longest 28s
+    Ribbon line: ↑16m23s ▸ ↓16s ▸ ↑1m22s ▸ ↓14s ▸ now
+    """
+    events = list(state["events"])
+    now_dt = datetime.now()
+
+    is_up = bool(state["last_state"])
+    pill_color = GREEN if is_up else RED
+    label = "UP" if is_up else "DOWN"
+    elapsed = (now_dt - events[-1]["time"]).total_seconds()
+    pill = (
+        f"{ansi(pill_color)}●{ansi(RESET)} "
+        f"{ansi(BOLD)}{ansi(pill_color)}{label}{ansi(RESET)} "
+        f"{ansi(DIM)}for{ansi(RESET)} {format_duration(elapsed)}"
+    )
+
+    outages = sum(1 for e in events if e["state"] == "DOWN")
+    summary_bits = []
+    if outages:
+        summary_bits.append(f"{outages} outage{'s' if outages != 1 else ''}")
+        longest = longest_outage_seconds(state)
+        if longest:
+            summary_bits.append(f"longest {format_duration(longest)}")
+    summary = (
+        f"{ansi(DIM)}{(' ' + chr(0xB7) + ' ').join(summary_bits)}{ansi(RESET)}"
+        if summary_bits else ""
+    )
+
+    header = f"  {'Transitions':<14} {pill}"
+    if summary:
+        header += f"    {summary}"
+
+    # Skip the ribbon row when there's only an in-progress segment to show.
+    if len(events) < 2:
+        return [header]
+
+    segments = []
+    for i, ev in enumerate(events[:-1]):
+        dur = (events[i + 1]["time"] - ev["time"]).total_seconds()
+        arrow = "↑" if ev["state"] == "UP" else "↓"
+        color = GREEN if ev["state"] == "UP" else RED
+        segments.append(f"{ansi(color)}{arrow}{format_duration(dur)}{ansi(RESET)}")
+    segments.append(f"{ansi(DIM)}now{ansi(RESET)}")
+
+    truncated = len(segments) > max_segments
+    if truncated:
+        segments = segments[-max_segments:]
+
+    sep = f" {ansi(GRAY)}▸{ansi(RESET)} "
+    ribbon = sep.join(segments)
+    if truncated:
+        ribbon = f"{ansi(DIM)}…{ansi(RESET)}{sep}{ribbon}"
+
+    return [header, f"  {'':<14} {ribbon}"]
+
+
+def timing_color(v, good, bad):
+    if v <= good:
+        c = GREEN
+    elif v <= bad:
+        c = YELLOW
+    else:
+        c = RED
+    return f"{ansi(c)}{v:>5.0f}{ansi(RESET)}"
+
+
+def render_countdown(row, interval, prefix=""):
+    next_check = time.monotonic() + interval
+    while True:
+        remaining = next_check - time.monotonic()
+        if remaining <= 0:
+            break
+        filled = round(remaining / interval * 10)
+        bar = f"{ansi(CYAN)}{'█' * filled}{ansi(GRAY)}{'░' * (10 - filled)}{ansi(RESET)}"
+        line = f"{prefix}{bar} {ansi(DIM)}{int(remaining)}s{ansi(RESET)}\033[K"
+        sys.stdout.write(f"\033[{row};1H{line}")
+        sys.stdout.flush()
+        time.sleep(1)
+
+
+def session_summary(state):
+    total = state["up_count"] + state["down_count"]
+    if total == 0:
+        return "No checks completed."
+    latencies = [v for v in state["latency_hist"] if v is not None]
+    losses = [v for v in state["loss_hist"] if v is not None]
+    health = [v for v in state["health_hist"] if v is not None]
+    outages = sum(1 for _, s in state["transitions"] if s == "DOWN")
+    worst_health = min(health) if health else None
+    longest = longest_outage_seconds(state)
+    worst_window = worst_window_health(state, seconds=300)
+    return (
+        f"{total} checks, uptime {uptime_pct(state):.1f}%, outages {outages}, "
+        f"longest outage {format_duration(longest)}, "
+        f"median latency {fmt_num(percentile(latencies, 50), 0) or '--'} ms, "
+        f"p95 latency {fmt_num(percentile(latencies, 95), 0) or '--'} ms, "
+        f"avg loss {fmt_num(statistics.mean(losses) if losses else None)}%, "
+        f"worst health {fmt_num(worst_health, 0) or '--'}/100, "
+        f"worst 5m avg {fmt_num(worst_window, 0) or '--'}/100"
+    )
+
+
+def longest_outage_seconds(state):
+    events = state["events"]
+    if not events:
+        return 0
+    longest = 0
+    down_since = None
+    end_time = datetime.now()
+    for event in events:
+        if event["state"] == "DOWN" and down_since is None:
+            down_since = event["time"]
+        elif event["state"] == "UP" and down_since is not None:
+            longest = max(longest, (event["time"] - down_since).total_seconds())
+            down_since = None
+    if down_since is not None:
+        longest = max(longest, (end_time - down_since).total_seconds())
+    return longest
+
+
+def worst_window_health(state, seconds=300):
+    """Worst average health over any rolling window of `seconds`. O(n) sliding window."""
+    checks = list(state["check_log"])
+    if not checks:
+        return None
+    worst = None
+    j = 0
+    window_sum = 0.0
+    window_count = 0
+    for i, start in enumerate(checks):
+        while j < len(checks) and (checks[j]["time"] - start["time"]).total_seconds() <= seconds:
+            window_sum += checks[j]["health"]
+            window_count += 1
+            j += 1
+        if window_count > 0:
+            avg = window_sum / window_count
+            worst = avg if worst is None else min(worst, avg)
+        window_sum -= start["health"]
+        window_count -= 1
+    return worst
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def main():
+    global USE_COLOR
+    args = parse_args()
+    USE_COLOR = not args.no_color and sys.stdout.isatty()
+    state = new_state()
+    init_csv(args.log_file)
+    wifi_poller = WifiInfoPoller(interval=30, wait_first=args.once)
+
+    if not args.quiet and not args.once:
+        clear_screen()
+
+    while True:
+        try:
+            result = collect_check(args, state, wifi_poller, force_probes=args.once)
+            log_csv(args.log_file, result)
+            log_jsonl(args.json_log, result)
+
+            if args.json:
+                print(json.dumps(result, indent=None if args.quiet else 2, sort_keys=True))
+            elif args.once or args.quiet:
+                if not args.quiet:
+                    print(plain_summary(result))
+            else:
+                countdown_row, countdown_prefix = render_dashboard(args, state, result)
+
+            state["iteration"] += 1
+
+            if args.once:
+                sys.exit(0 if result["health"] >= args.threshold and result["is_up"] else 1)
+            if not args.quiet:
+                render_countdown(countdown_row, args.interval, countdown_prefix)
+            else:
+                time.sleep(args.interval)
+
+        except KeyboardInterrupt:
+            if not args.quiet:
+                clear_screen()
+            print(f"\n{ansi(BOLD)}netcheck{ansi(RESET)} stopped. {session_summary(state)}")
+            if args.log_file:
+                print(f"CSV log: {args.log_file}")
+            if args.json_log:
+                print(f"JSONL log: {args.json_log}")
+            print("")
+            sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()
