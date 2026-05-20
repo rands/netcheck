@@ -8,3 +8,6 @@ netcheck.csv
 .DS_Store
 .venv/
 .claude/
+
+launch.md
+

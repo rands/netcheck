@@ -60,6 +60,16 @@ LOSS_GOOD, LOSS_WARN = 2, 10
 DNS_GOOD, DNS_WARN = 200, 800
 THROUGHPUT_GOOD, THROUGHPUT_WARN = 50, 10  # KB/s
 
+# --- PEP / TCP-accelerator detection ---
+# When TCP completes far faster than ICMP RTT permits, there's a Performance
+# Enhancing Proxy on path terminating TCP locally. Common on satellite links.
+# Streaming sockets (long-poll, SSE, WebSockets) can wedge silently when the
+# proxy's backhaul drops without forwarding FIN/RST.
+PEP_MIN_RTT_MS = 150       # ignore signal on low-latency links
+PEP_TCP_RATIO = 0.3        # min(probe TCP) < ratio × ICMP RTT ⇒ proxy detected
+PEP_ENTER_CYCLES = 2       # consecutive positive signals before flipping on
+PEP_EXIT_CYCLES = 3        # consecutive negative signals before clearing
+
 # --- ANSI colors ---
 RESET = "\033[0m"
 BOLD = "\033[1m"
@@ -521,6 +531,39 @@ def compute_health(latency, jitter, loss, dns_ms, throughput, gw_ok=True, probe_
     return health, components
 
 
+def detect_pep(icmp_latency_ms, probe_results):
+    """Detect a TCP accelerator on path.
+
+    Returns (signal, min_tcp_ms). signal is True/False when we have enough data
+    to decide, None when we don't. min_tcp_ms is the fastest observed TCP
+    handshake across successful probes (for display), or None.
+    """
+    if icmp_latency_ms is None or icmp_latency_ms <= PEP_MIN_RTT_MS:
+        return None, None
+    tcp_times = [
+        p["result"]["tcp"]
+        for p in (probe_results or [])
+        if p["result"].get("ok") and p["result"].get("tcp") is not None
+    ]
+    if not tcp_times:
+        return None, None
+    min_tcp = min(tcp_times)
+    return min_tcp < icmp_latency_ms * PEP_TCP_RATIO, min_tcp
+
+
+def update_pep_state(state, signal):
+    """Drive the sticky pep_active flag from a per-cycle signal (True/False/None)."""
+    if signal is True:
+        state["pep_signal_streak"] = max(1, state["pep_signal_streak"] + 1)
+    elif signal is False:
+        state["pep_signal_streak"] = min(-1, state["pep_signal_streak"] - 1)
+    # None: no fresh evidence — leave the streak alone.
+    if not state["pep_active"] and state["pep_signal_streak"] >= PEP_ENTER_CYCLES:
+        state["pep_active"] = True
+    elif state["pep_active"] and state["pep_signal_streak"] <= -PEP_EXIT_CYCLES:
+        state["pep_active"] = False
+
+
 def bottleneck(components):
     labels = {
         "loss": "packet loss",
@@ -615,6 +658,8 @@ def init_csv(path):
                 "tx_rate_mbps",
                 "channel",
                 "ping_targets",
+                "pep_active",
+                "pep_min_tcp_ms",
             ]
         )
 
@@ -649,6 +694,8 @@ def log_csv(path, result):
         wifi.get("tx_rate", ""),
         wifi.get("channel", ""),
         json.dumps(result["ping_results"], separators=(",", ":")),
+        "yes" if result.get("pep_active") else "no",
+        fmt_num(result.get("pep_min_tcp_ms")),
     ]
     with open(path, "a", newline="") as f:
         csv.writer(f).writerow(row)
@@ -806,6 +853,11 @@ def collect_check(args, state, wifi_poller, force_probes=False):
     state["health_hist"].append(health)
     _record_transition(args, state, now, is_up, health)
 
+    pep_signal, pep_min_tcp = detect_pep(pings["avg_latency"], state["probe_results"])
+    update_pep_state(state, pep_signal)
+    if pep_min_tcp is not None:
+        state["pep_min_tcp_ms"] = pep_min_tcp
+
     result = {
         "timestamp": now.isoformat(),
         "is_up": is_up,
@@ -828,6 +880,8 @@ def collect_check(args, state, wifi_poller, force_probes=False):
         "probe_results": state["probe_results"],
         "uptime_pct": uptime_pct(state),
         "checks": state["up_count"] + state["down_count"],
+        "pep_active": state["pep_active"],
+        "pep_min_tcp_ms": state["pep_min_tcp_ms"],
     }
     state["check_log"].append({"time": now, "health": health, "is_up": is_up})
     state["last_result"] = result
@@ -873,6 +927,9 @@ def new_state():
         "probe_results": [],
         "iteration": 0,
         "last_result": None,
+        "pep_signal_streak": 0,
+        "pep_active": False,
+        "pep_min_tcp_ms": None,
     }
 
 
@@ -1006,6 +1063,8 @@ def render_dashboard(args, state, result):
         net_bits.append(f"{ansi(sig_color)}{sig_text}{ansi(RESET)}")
     if speed:
         net_bits.append(speed)
+    if result.get("pep_active"):
+        net_bits.append(f"{ansi(YELLOW)}{ansi(BOLD)}Stall-prone{ansi(RESET)}")
     header_left = (
         f"{ansi(BOLD)}{ansi(CYAN)}netcheck{ansi(RESET)}   "
         f"{ansi(state_color)}●{ansi(RESET)} "
@@ -1106,6 +1165,21 @@ def render_dashboard(args, state, result):
         f"  {'Gateway':<14} {ansi(gw_color)}●{ansi(RESET)} "
         f"{ansi(gw_color)}{gw_latency_str}{ansi(RESET)}{sep}{ansi(DIM)}{gw_ip}{ansi(RESET)}"
     )
+    if result.get("pep_active"):
+        tcp_ms = result.get("pep_min_tcp_ms")
+        rtt = result.get("avg_latency_ms")
+        if tcp_ms is not None and rtt is not None:
+            detail = f"TCP terminates locally ({tcp_ms:.0f} ms){sep}real RTT {rtt:.0f} ms"
+        else:
+            detail = "TCP proxy on path"
+        lines.append(
+            f"  {'Path':<14} {ansi(YELLOW)}● Stall-prone{ansi(RESET)}{sep}"
+            f"{ansi(DIM)}{detail}{ansi(RESET)}"
+        )
+        lines.append(
+            f"  {'':<14} {ansi(YELLOW)}↳ streaming sessions can wedge silently — "
+            f"restart if quiet{ansi(RESET)}"
+        )
     lines.append("")
 
     if result["probe_results"]:

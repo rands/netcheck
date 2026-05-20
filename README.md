@@ -42,10 +42,29 @@ Every `--interval` seconds (default 10s), in parallel:
 - **Captive portal** — detects unexpected responses from `detectportal.firefox.com`
 - **Site probes** (every Nth check) — full `curl` timing breakdown for Google, Wikipedia, GitHub, Reddit, NYTimes
 - **WiFi info** — SSID, signal, link rate, band (polled in background)
+- **TCP accelerator (PEP) detection** — flags networks where TCP completes far faster than ICMP RTT permits (a Performance Enhancing Proxy is terminating connections locally). Common on satellite links and some in-flight WiFi. See [Stall-prone networks](#stall-prone-networks) below.
 
 All of these roll into a weighted 0–100 **health score** with a plain-English quality label (`Video/calls OK`, `Browsing OK`, `Chat/text only`, `Barely usable`, `Unusable`) and a one-word **bottleneck** call-out so you know whether to blame DNS, loss, throughput, etc.
 
 When the network is broken, a yellow `↳` diagnosis line under Health explains *why* (captive portal expired, gateway reachable but Internet unreachable, gateway unreachable, etc.).
+
+## Stall-prone networks
+
+On satellite and many in-flight WiFi setups, the provider runs a TCP accelerator (PEP — Performance Enhancing Proxy) that terminates your connection locally and forwards bytes over its own backhaul. Short HTTP requests feel fast, but long-lived streaming sessions — SSE, WebSockets, long-poll, SSH — can wedge silently when the backhaul drops because the proxy never forwards the FIN/RST.
+
+netcheck flags this by comparing your minimum TCP handshake against your ICMP round-trip. If TCP completes in well under what physics permits, you're behind a PEP:
+
+```
+netcheck   ● UP   GoGoInflight · Stall-prone                            8m 12s
+
+  ...
+
+  Gateway        ● 18 ms via icmp · 192.168.16.1
+  Path           ● Stall-prone · TCP terminates locally (45 ms) · real RTT 720 ms
+                 ↳ streaming sessions can wedge silently — restart if quiet
+```
+
+The flag is sticky — it requires multiple consecutive positive signals before turning on and multiple negatives before clearing, so it doesn't flicker on noisy links.
 
 ## Quick start
 
@@ -88,7 +107,8 @@ By default, every check appends a row to `~/.netcheck/netcheck.csv`. Schema:
 timestamp, state, health, bottleneck, latency_ms, latency_p50_ms, latency_p95_ms,
 jitter_ms, loss_pct, dns_ms, throughput_kBps, gateway_ok, gateway_ms,
 gateway_method, captive_portal, portal_status, portal_final_url,
-ssid, rssi, noise, tx_rate_mbps, channel, ping_targets
+ssid, rssi, noise, tx_rate_mbps, channel, ping_targets,
+pep_active, pep_min_tcp_ms
 ```
 
 `ping_targets` is a compact JSON blob of the per-target results. Good for grepping or feeding into a notebook later. Pass `--json-log path.jsonl` if you'd rather have full structured records.
