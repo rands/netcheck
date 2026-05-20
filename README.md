@@ -69,7 +69,7 @@ The flag is sticky — it requires multiple consecutive positive signals before 
 ## Quick start
 
 ```bash
-git clone https://github.com/YOUR-ORG/netcheck.git
+git clone https://github.com/rands/netcheck.git
 cd netcheck
 ./netcheck                      # live dashboard
 ./netcheck --once               # one check, plain output, exit
